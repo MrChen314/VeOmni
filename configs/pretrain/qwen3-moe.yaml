@@ -15,8 +15,9 @@ data:
 
 train:
   output_dir: Qwen3-30B-A3B_CT
-  data_parallel_mode: fsdp1
+  data_parallel_mode: fsdp2
   ulysses_parallel_size: 1
+  expert_parallel_size: 4
   global_batch_size: 32
   micro_batch_size: 1
   rmpad: false
@@ -36,12 +37,13 @@ train:
   enable_full_shard: true
   enable_fsdp_offload: false
   enable_activation_offload: false
-  init_device: cpu
+  init_device: meta
   enable_full_determinism: false
   empty_cache_steps: 500
   ckpt_manager: dcp
   load_checkpoint_path: ""
   save_steps: 100
   save_hf_weights: true
+  use_wandb: false
   wandb_project: Qwen3-30B-A3B
   wandb_name: Qwen3-30B-A3B-CT
