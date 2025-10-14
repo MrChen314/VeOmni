@@ -74,10 +74,16 @@ def process_sample(
     token_num_inputs, image_inputs = {}, {}
     image_grid_thw = None
 
-    if "images" in sample and sample["images"]:
+    if "image" in sample and "images" not in sample:
+        sample["images"] = sample["image"]
+    if "images" in sample:
         images = []
-        for image in sample["images"]:
-            images.append(Image.open(BytesIO(image)).convert("RGB"))
+        if isinstance(sample["images"], str):
+            images.append(Image.open(sample["images"]).convert("RGB"))
+        elif isinstance(sample["images"], list):
+            images.append(Image.open(sample["images"][0]).convert("RGB"))
+        else:
+            images.append(Image.open(BytesIO(sample["images"])).convert("RGB"))
 
         image_inputs = processor.image_processor(images=images, return_tensors="pt")
         image_grid_thw = image_inputs["image_grid_thw"]
@@ -127,9 +133,16 @@ class MyTrainingArguments(TrainingArguments):
 
 
 @dataclass
+class MyDataArguments(DataArguments):
+    source_name: str = field(
+        default=None,
+        metadata={"help": "Source name of dataset."},
+    )
+
+@dataclass
 class Arguments:
     model: "ModelArguments" = field(default_factory=ModelArguments)
-    data: "DataArguments" = field(default_factory=DataArguments)
+    data: "MyDataArguments" = field(default_factory=MyDataArguments)
     train: "MyTrainingArguments" = field(default_factory=MyTrainingArguments)
 
 
@@ -181,6 +194,7 @@ def main():
         processor=processor,
         chat_template=chat_template,
         position_id_func=position_id_func,
+        source_name=args.data.source_name,
     )
 
     if args.train.rmpad:
