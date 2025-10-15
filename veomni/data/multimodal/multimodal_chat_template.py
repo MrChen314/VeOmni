@@ -1000,6 +1000,7 @@ TEMPLATES = {
     "qwen2vl_pretrain": Qwen2VLPretrainTemplate,
     "qwen2_5omni": Qwen25OmniChatTemplate,
     "qwen2_5vl": Qwen2VLChatTemplate,  # same as qwen2vl
+    "qwen3vl": Qwen2VLChatTemplate,
     "janus": JanusChatTemplate,
     "llama": LlamaPretrainTemplate,
     "qwen3moe": Qwen3MoeChatTemplate,
