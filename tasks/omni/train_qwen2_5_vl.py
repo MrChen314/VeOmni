@@ -368,6 +368,7 @@ def main():
         )
         data_iterator = iter(train_dataloader)
         for _ in range(start_step, args.train.train_steps):
+            model.unshard()
             global_step += 1
             try:
                 micro_batches: List[Dict[str, Any]] = next(data_iterator)

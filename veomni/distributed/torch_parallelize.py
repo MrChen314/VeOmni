@@ -358,6 +358,31 @@ def parallelize_model_fsdp2(
     # shard root model
     fully_shard(model, **fsdp_kwargs)
 
+    def set_modules_to_forward_prefetch(model, num_to_forward_prefetch):
+        for i, layer in enumerate(model):
+            if i >= len(model) - num_to_forward_prefetch:
+                break
+            layers_to_prefetch = [
+                model[i + j] for j in range(1, num_to_forward_prefetch + 1)
+            ]
+            layer.set_modules_to_forward_prefetch(layers_to_prefetch)
+    
+    def set_modules_to_backward_prefetch(model, num_to_backward_prefetch):
+        for i, layer in enumerate(model):
+            if i < num_to_backward_prefetch:
+                continue
+            layers_to_prefetch = [
+                model[i - j] for j in range(1, num_to_backward_prefetch + 1)
+            ]
+            layer.set_modules_to_backward_prefetch(layers_to_prefetch)
+
+    # todo:vit第一层不切，但挂hook prefetch后面层；切llm的embedding和llm_head
+    set_modules_to_forward_prefetch(model.visual.blocks, num_to_forward_prefetch=2)
+    model.visual.blocks[-1].set_modules_to_forward_prefetch([model.model.layers[0]])
+    set_modules_to_forward_prefetch(model.model.layers, num_to_forward_prefetch=1)
+    set_modules_to_backward_prefetch(model.visual.blocks, num_to_backward_prefetch=2)
+    set_modules_to_backward_prefetch(model.model.layers, num_to_backward_prefetch=1)
+
     # configure manual prefetching when needed
     need_manual_prefetch = parallel_state.ep_enabled or mp_ignored_classes is not None
     if need_manual_prefetch:

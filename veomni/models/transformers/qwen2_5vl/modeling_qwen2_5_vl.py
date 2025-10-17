@@ -26,6 +26,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
+import torch_npu
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
@@ -150,11 +151,13 @@ class Qwen2RMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        return torch_npu.npu_rms_norm(hidden_states, self.weight, epsilon=self.variance_epsilon)[0]
+
+        # input_dtype = hidden_states.dtype
+        # hidden_states = hidden_states.to(torch.float32)
+        # variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        # hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        # return self.weight * hidden_states.to(input_dtype)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
@@ -256,8 +259,10 @@ def apply_rotary_pos_emb_vision(
     orig_k_dtype = k.dtype
     q, k = q.float(), k.float()
     cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = torch_npu.npu_rotary_mul(q.unsqueeze(0), cos.unsqueeze(0), sin.unsqueeze(0)).squeeze(0)
+    k_embed = torch_npu.npu_rotary_mul(k.unsqueeze(0), cos.unsqueeze(0), sin.unsqueeze(0)).squeeze(0)
+    # q_embed = (q * cos) + (rotate_half(q) * sin)
+    # k_embed = (k * cos) + (rotate_half(k) * sin)
     q_embed = q_embed.to(orig_q_dtype)
     k_embed = k_embed.to(orig_k_dtype)
     return q_embed, k_embed
@@ -328,7 +333,19 @@ class Qwen2_5_VLVisionSdpaAttention(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
-        q, k, v = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+        
+        # ulysses sp patch: qkv projection
+        qkv = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3)
+        
+        unpadded_dim_size = cu_seqlens[-1]
+        if get_parallel_state().ulysses_enabled:
+            qkv = gather_seq_scatter_heads(qkv, seq_dim=1, head_dim=2)
+            sp_padding_size = qkv.size(1) - unpadded_dim_size
+            if sp_padding_size > 0:
+                qkv = unpad_tensor(qkv, dim=1, padding_size=sp_padding_size)
+            seq_length = qkv.shape[1]
+        q, k, v = qkv.unbind(0)
+
         if position_embeddings is None:
             logger.warning_once(
                 "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
@@ -343,24 +360,41 @@ class Qwen2_5_VLVisionSdpaAttention(nn.Module):
             cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
-        attention_mask = torch.zeros([1, seq_length, seq_length], device=q.device, dtype=torch.bool)
-        for i in range(1, len(cu_seqlens)):
-            attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = True
-        q = q.transpose(0, 1)
-        k = k.transpose(0, 1)
-        v = v.transpose(0, 1)
-        attn_output = F.scaled_dot_product_attention(
-            q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), attention_mask, dropout_p=0.0
-        )
-        attn_output = attn_output.squeeze(0).transpose(0, 1)
-        attn_output = attn_output.reshape(seq_length, -1)
+        attn_output = torch_npu.npu_fusion_attention(
+                q, k, v, q.shape[1],
+                pse=None,
+                padding_mask=None,
+                atten_mask=None,
+                scale=1.0 / math.sqrt(q.shape[-1]),
+                keep_prob=1,
+                input_layout='TND',
+                actual_seq_qlen=cu_seqlens.tolist()[1:],
+                actual_seq_kvlen=cu_seqlens.tolist()[1:],
+                pre_tockens=2147483647,
+                next_tockens=2147483647,
+                sparse_mode=0)[0]
+
+        # attention_mask = torch.zeros([1, seq_length, seq_length], device=q.device, dtype=torch.bool)
+        # for i in range(1, len(cu_seqlens)):
+        #     attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = True
+        # q = q.transpose(0, 1)
+        # k = k.transpose(0, 1)
+        # v = v.transpose(0, 1)
+        # attn_output = F.scaled_dot_product_attention(
+        #     q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), attention_mask, dropout_p=0.0
+        # )
+        # attn_output = attn_output.squeeze(0).transpose(0, 1)
+        if get_parallel_state().ulysses_enabled:
+            attn_output = pad_tensor(attn_output, dim=0, padding_size=sp_padding_size)
+            attn_output = gather_heads_scatter_seq(attn_output, head_dim=1, seq_dim=0)
+        attn_output = attn_output.reshape(hidden_states.shape[0], -1)
         attn_output = self.proj(attn_output)
         return attn_output
 
 
 QWEN2_5_VL_VISION_ATTENTION_CLASSES = {
     "eager": Qwen2_5_VLVisionAttention,
-    "flash_attention_2": Qwen2_5_VLVisionFlashAttention2,
+    "flash_attention_2": Qwen2_5_VLVisionSdpaAttention,
     "sdpa": Qwen2_5_VLVisionSdpaAttention,
 }
 
@@ -1146,6 +1180,12 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
         key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
 
+        # ulysses sp patch: qkv proj
+        if get_parallel_state().ulysses_enabled:
+            query_states = gather_seq_scatter_heads(query_states, seq_dim=2, head_dim=1)
+            key_states = gather_seq_scatter_heads(key_states, seq_dim=2, head_dim=1)
+            value_states = gather_seq_scatter_heads(value_states, seq_dim=2, head_dim=1)
+
         cos, sin = position_embeddings
         query_states, key_states = apply_multimodal_rotary_pos_emb(
             query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
@@ -1164,7 +1204,7 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
 
         # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
         # Reference: https://github.com/pytorch/pytorch/issues/112577.
-        if query_states.device.type in ["cuda", "npu"] and attention_mask is not None:
+        if query_states.device.type == "cuda" and attention_mask is not None:
             query_states = query_states.contiguous()
             key_states = key_states.contiguous()
             value_states = value_states.contiguous()
@@ -1183,6 +1223,10 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
             is_causal=is_causal,
         )
 
+        # ulysses sp patch: o projection
+        if get_parallel_state().ulysses_enabled:
+            attn_output = gather_heads_scatter_seq(attn_output, head_dim=2, seq_dim=1)
+
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
 
@@ -1193,7 +1237,7 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
 
 QWEN2_5_VL_ATTENTION_CLASSES = {
     "eager": Qwen2_5_VLAttention,
-    "flash_attention_2": Qwen2_5_VLFlashAttention2,
+    "flash_attention_2": Qwen2_5_VLSdpaAttention,
     "sdpa": Qwen2_5_VLSdpaAttention,
 }
 
